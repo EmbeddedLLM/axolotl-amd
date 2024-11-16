@@ -1,0 +1,135 @@
+# Default ROCm 6.2 base image
+ARG BASE_IMAGE="ghcr.io/embeddedllm/pytorch-rocm-flash-attn:rocm6.2.3-py3.10-pytorch2.5.0-flash-attn-53a4f34"
+
+# Default ROCm ARCHes to build vLLM for.
+# ARG PYTORCH_ROCM_ARCH="gfx908;gfx90a;gfx942;gfx1100"
+ARG PYTORCH_ROCM_ARCH="gfx942"
+
+# Whether to install CK-based flash-attention
+# If 0, will not install flash-attention
+ARG BUILD_FA="1"
+# ARG FA_GFX_ARCHS="gfx90a;gfx942"
+ARG FA_GFX_ARCHS="gfx942"
+ARG FA_BRANCH="3cea2fb"
+
+# Whether to build triton on rocm
+ARG BUILD_TRITON="1"
+ARG TRITON_BRANCH="e192dba"
+
+ARG BUILD_XFORMERS="1"
+ARG XFORMERS_COMPILE_JOBS=128
+# ARG HIP_ARCHITECTURES="gfx90a gfx942"
+ARG HIP_ARCHITECTURES="gfx942"
+
+### Base image build stage
+FROM $BASE_IMAGE AS base
+
+### Triton wheel build stage
+FROM base AS build_triton
+ARG BUILD_TRITON
+ARG TRITON_BRANCH
+# Build triton wheel if `BUILD_TRITON = 1`
+RUN --mount=type=cache,target=${CCACHE_DIR} \
+    if [ "$BUILD_TRITON" = "1" ]; then \
+    mkdir -p libs \
+    && cd libs \
+    && python3 -m pip install ninja cmake wheel pybind11 \
+    && git clone https://github.com/OpenAI/triton.git \
+    && cd triton \
+    && git checkout "${TRITON_BRANCH}" \
+    && cd python \
+    && python3 setup.py bdist_wheel --dist-dir=/install; \
+    # Create an empty directory otherwise as later build stages expect one
+    else mkdir -p /install; \
+    fi
+
+### XFormers wheel build stage
+FROM base AS build_xformers
+ARG BUILD_XFORMERS
+ARG XFORMERS_COMPILE_JOBS
+ARG HIP_ARCHITECTURES
+ENV MAX_JOBS=${XFORMERS_COMPILE_JOBS} 
+ENV HIP_ARCHITECTURES=${HIP_ARCHITECTURES} 
+# Build triton wheel if `BUILD_TRITON = 1`
+RUN --mount=type=cache,target=${CCACHE_DIR} \
+    if [ "$BUILD_TRITON" = "1" ]; then \
+    mkdir -p libs \
+    && mkdir -p /install \
+    && cd libs \
+    && python3 -m pip install uv \
+    && uv pip install ninja \
+    && git clone --recursive https://github.com/rocm/xformers \
+    && cd xformers \
+    && uv pip install -r requirements.txt --extra-index-url=https://download.pytorch.org/whl/nightly/rocm6.2 \
+    && uv build . --wheel --no-build-isolation --verbose --offline \
+    && cp -r dist/*.whl /install \
+    && python3 setup.py bdist_wheel --dist-dir=/install; \
+    # Create an empty directory otherwise as later build stages expect one
+    else mkdir -p /install; \
+    fi
+
+### Final vLLM build stage
+FROM base AS final
+# Import the vLLM development directory from the build context
+COPY . .
+ARG GIT_REPO_CHECK=0
+RUN --mount=type=bind,source=.git,target=.git \
+    if [ "$GIT_REPO_CHECK" != 0 ]; then bash tools/check_repo.sh ; fi
+
+RUN python3 -m pip install --upgrade pip
+
+# Package upgrades for useful functionality or to avoid dependency issues
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --upgrade numba scipy huggingface-hub[cli] pytest-shard
+
+
+# Workaround for ray >= 2.10.0
+ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
+# Silences the HF Tokenizers warning
+ENV TOKENIZERS_PARALLELISM=false
+
+# RUN --mount=type=cache,target=${CCACHE_DIR} \
+#     --mount=type=bind,source=.git,target=.git \
+#     --mount=type=cache,target=/root/.cache/pip \
+#     python3 -m pip install -Ur requirements-rocm.txt \
+#     && python3 setup.py clean --all \
+#     && python3 setup.py develop
+
+# Clone the github repo
+RUN git clone --recurse https://github.com/ROCm/bitsandbytes.git \
+    && cd bitsandbytes \
+    && git checkout rocm_enabled_multi_backend \
+    && python3 -m pip install -r requirements-dev.txt \
+    && cmake -DBNB_ROCM_ARCH="gfx942" -DCOMPUTE_BACKEND=hip -S . \
+    && make \
+    && python3 -m pip uninstall -y bitsandbytes \
+    && python3 setup.py install
+
+RUN git clone https://github.com/ROCm/xformers.git \
+    && cd xformers/ \
+    && git submodule update --init --recursive \
+    && python3 -m pip uninstall -y xformers \
+    && PYTORCH_ROCM_ARCH=gfx942 python setup.py install
+
+# Copy triton wheel(s) into final image if they were built
+RUN --mount=type=bind,from=build_triton,src=/install,target=/install \
+    mkdir -p libs \
+    && if ls /install/*.whl; then \
+        cp /install/*.whl libs \
+        # Preemptively uninstall to avoid same-version no-installs
+        && python3 -m pip uninstall -y triton; fi
+
+# Copy triton wheel(s) into final image if they were built
+RUN --mount=type=bind,from=build_xformers,src=/install,target=/install \
+    mkdir -p libs \
+    && if ls /install/*.whl; then \
+        cp /install/*.whl libs \
+        # Preemptively uninstall to avoid same-version no-installs
+        && python3 -m pip uninstall -y xformers; fi
+
+# Install wheels that were built to the final image
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if ls libs/*.whl; then \
+    python3 -m pip install libs/*.whl; fi
+
+CMD ["/bin/bash"]
